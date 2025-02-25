@@ -1,0 +1,6 @@
+Metadata-Version: 2.2
+Name: kmeans-gpu
+Version: 0.1
+Summary: A k-means implementation for GPU
+Author-email: zeonfaiho@gmail.com
+Requires-Dist: torch

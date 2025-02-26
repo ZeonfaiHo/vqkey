@@ -1,5 +1,7 @@
 # Constructing Codebooks and Using A$^2$ATS Models: A Simple Guide
 
+Taking Llama-3-8B-Instruct as an example.
+
 ## Prerequisites
 
 - Download the Llama-3.1-8B-Instruct model and place it in `../huggingface-models/Llama-3.1-8B-Instruct`.
@@ -53,4 +55,4 @@ output_ids = model.generate(inputs)
 print(tokenizer.decode(output_ids))
 ```
 
-Our custom sparse attention kernels `selective_attention` used by `models.llama` have shown good performance on the Intel Xeon Platinum 8469C CPU, but performance on other CPUs may still need optimization and could encounter compatibility issues. We are actively optimizing our custom kernels to achieve the best efficiency on a broad range of CPUs. We will release these kernels once they become available. In the meantime, please use `model.llama_masked` as a mathematically equivalent fallback for accuracy evaluation.
+Our custom sparse attention kernel `selective_attention` used by `models.llama` has shown good performance on the Intel Xeon Platinum 8469C CPU, but performance on other CPUs may still need optimization and could encounter compatibility issues. We are actively optimizing our custom kernels to achieve the best efficiency on a broad range of CPUs. We will release these kernels once they become available. In the meantime, please use `models.llama_masked` as a mathematically equivalent fallback for accuracy evaluation.

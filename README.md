@@ -1,6 +1,6 @@
 # Constructing Codebooks and Using A$^2$ATS Models: A Simple Guide
 
-Taking Llama-3-8B-Instruct as an example.
+Taking Llama-3.1-8B-Instruct as an example.
 
 ## Prerequisites
 

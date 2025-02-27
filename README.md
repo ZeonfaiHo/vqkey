@@ -18,7 +18,7 @@ The `kmeans-gpu` package is a GPU-accelerated implementation of the k-means++ cl
 
 ## Constructing Codebooks
 
-Run the jupyter notebook: `construct-codebooks/cluster.ipynb`. Users can adjust the codebook size by modifying the `codebook_size` variable. The constructed codebooks and Cholesky factors will be placed in the `codebooks` directory.
+Run the jupyter notebook: `./notebooks/construct_codebooks.ipynb`. Users can adjust the codebook size by modifying the `codebook_size` variable. The constructed codebooks and Cholesky factors will be placed in the `./codebooks` directory.
 
 ## Running A$^2$ATS Models
 

@@ -239,8 +239,6 @@ def llama_attention_forward_wrapper(wrope_local_window,
             else:
                 pairwise_distance = ((key_states[:, :, :, None, :] - self.codebook[None, :, None, :, :])**2).sum(dim=-1)
 
-            pairwise_distance = torch.rand(bsz, self.num_key_value_heads, q_len, self.codebook.size(1), device=device, dtype=dtype)
-
         vq_ids = torch.argmin(pairwise_distance, dim=-1)
 
         if q_len == 1:

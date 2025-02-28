@@ -5,6 +5,7 @@ from transformers import AutoTokenizer
 from transformers.models.llama.modeling_llama import *
 from transformers.cache_utils import *
 import types
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 import selective_attention
 
@@ -15,17 +16,20 @@ class DecodingStatistics:
 
 
 class LLM:
-    def __init__(self, 
-                 model_name: str, 
-                 codebook_dir: str, 
-                 device: str = "cuda", 
-                 dtype = torch.bfloat16,
-                 wrope_local_window: int = 64,
-                 wrope_relative_pos: int = 2048,
-                 attention_sink : int = 8,
-                 sampling_ratio: float = 0.0,
-                 topk: float = 0.0,
-                 ):
+    def __init__(
+            self, 
+            model_name: str, 
+            codebook_dir: str, 
+            codebook_name: str = None,
+            cholesky_factors: str = None,
+            device: str = "cuda", 
+            dtype = torch.bfloat16,
+            wrope_local_window: int = 64,
+            wrope_relative_pos: int = 2048,
+            attention_sink : int = 8,
+            sampling_ratio: float = 0.0,
+            topk: float = 0.0,
+        ):
         self.device = device
         self.dtype = dtype
 
@@ -37,8 +41,12 @@ class LLM:
 
             self.hf_model = LlamaForCausalLM.from_pretrained(model_name, torch_dtype=dtype, device_map=device, _attn_implementation="eager")
 
-            cholesky_factors, inv_cholesky_factors = torch.load(f"{codebook_dir}/llama-3-8b-cholesky_factors_64k_16k_3.pt", weights_only=False)
-            codebooks = torch.load(f"{codebook_dir}/llama-3-8b-codebooks_4096_64k_16k_3.pt", weights_only=False)
+            if cholesky_factors is not None:
+                cholesky_factors, inv_cholesky_factors = torch.load(f"{codebook_dir}/{cholesky_factors}", weights_only=False)
+            else:
+                cholesky_factors, inv_cholesky_factors = None, None
+
+            codebooks = torch.load(f"{codebook_dir}/{codebook_name}", weights_only=False)
 
             cos_wrope, sin_wrope = self.hf_model.model.rotary_emb(
                 torch.zeros((1,), device=device, dtype=dtype),
@@ -74,10 +82,10 @@ class LLM:
                 model_name, 
                 torch_dtype=dtype, 
                 device_map=device, 
-                # _attn_implementation="eager"
+                _attn_implementation="sdpa"
             )
         
-    def generate(self, input_ids, max_gen=128, chunk_size=8192):
+    def generate(self, input_ids, max_gen=128, chunk_size=2048):
         with torch.no_grad():
             prefill_len = len(input_ids)
             
@@ -109,7 +117,7 @@ class LLM:
             
             return input_ids[prefill_len:]
 
-    def benchmark_batched_inference(self, input_ids, bsz=1, warmup_len=8, test_len=128, chunk_size=8192):
+    def benchmark_batched_inference(self, input_ids, bsz=1, warmup_len=8, test_len=128, chunk_size=128 * 1024):
         with torch.no_grad():
             prefill_len = len(input_ids) - warmup_len - test_len
             
@@ -122,23 +130,35 @@ class LLM:
                     dtype=self.dtype
                 )
             else:
-                kv_cache = StaticCache(
-                    config=self.hf_model.config, 
-                    batch_size=1,
-                    max_cache_len=len(input_ids), 
-                    device=self.device, 
-                    dtype=self.dtype
-                )
+                # kv_cache = StaticCache(
+                #     config=self.hf_model.config, 
+                #     batch_size=1,
+                #     max_cache_len=len(input_ids), 
+                #     device=self.device, 
+                #     dtype=self.dtype
+                # )
+                kv_cache = DynamicCache()
 
-            for begin_idx in tqdm(range(0, prefill_len, chunk_size), desc="prefill"):
-                end_idx = min(begin_idx + chunk_size, prefill_len)
-                output = self.hf_model(torch.tensor(input_ids[begin_idx:end_idx]).unsqueeze(0).to(self.device), past_key_values=kv_cache)
-                kv_cache = output.past_key_values
+            torch.cuda.synchronize()
+            t_start = time.time()
+
+            with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+                for begin_idx in tqdm(range(0, prefill_len, chunk_size), desc="prefill"):
+                    end_idx = min(begin_idx + chunk_size, prefill_len)
+                    output = self.hf_model(torch.tensor(input_ids[begin_idx:end_idx]).unsqueeze(0).to(self.device), past_key_values=kv_cache)
+                    kv_cache = output.past_key_values
+
+            if isinstance(kv_cache, VQCacheOffload):
+                kv_cache.switch_between_cpu_and_gpu()
+            
+            torch.cuda.synchronize()
+            t_end = time.time()
+            print(f"[INFO] prefilling latency: {t_end - t_start}s")
 
             if isinstance(kv_cache, VQCacheOffload):
                 for layer_idx in tqdm(range(len(kv_cache.key_cache)), desc="offloading"):
-                    kv_cache.key_cache[layer_idx] = kv_cache.key_cache[layer_idx].to("cpu").to(torch.float32).expand(bsz, -1, -1, -1).contiguous().pin_memory()
-                    kv_cache.value_cache[layer_idx] = kv_cache.value_cache[layer_idx].to("cpu").to(torch.float32).expand(bsz, -1, -1, -1).contiguous().pin_memory()
+                    kv_cache.key_cache[layer_idx] = kv_cache.key_cache[layer_idx].expand(bsz, -1, -1, -1).contiguous()
+                    kv_cache.value_cache[layer_idx] = kv_cache.value_cache[layer_idx].expand(bsz, -1, -1, -1).contiguous()
 
                     if hasattr(kv_cache, "vq_ids"):
                         kv_cache.vq_ids[layer_idx] = kv_cache.vq_ids[layer_idx].expand(bsz, -1, -1).contiguous()
@@ -228,16 +248,19 @@ def llama_attention_forward_wrapper(wrope_local_window,
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-        if q_len > 1:
-            if hasattr(self, "cholesky_factor"):
-                pairwise_distance = torch.cdist((key_states @ self.cholesky_factor).to(torch.float32), self.codebook.to(torch.float32))
-            else:
-                pairwise_distance = torch.cdist(key_states.to(torch.float32), self.codebook.to(torch.float32))
-        elif q_len == 1:
-            if hasattr(self, "cholesky_factor"):
-                pairwise_distance = ((torch.matmul(key_states, self.cholesky_factor)[:, :, :, None, :] - self.codebook[None, :, None, :, :])**2).sum(dim=-1)
-            else:
-                pairwise_distance = ((key_states[:, :, :, None, :] - self.codebook[None, :, None, :, :])**2).sum(dim=-1)
+        def cdist(x, C):
+            # x: [bsz, num_key_value_heads, q_len, head_dim]
+            # C: [bsz, num_key_value_heads, codebook_size, head_dim]
+            x_ = (x**2).sum(dim=-1).unsqueeze(-1) # [bsz, num_key_value_heads, q_len, 1]
+            C_ = (C**2).sum(dim=-1).unsqueeze(-2) # [bsz, num_key_value_heads, 1, codebook_size]
+            inner_product = torch.matmul(x, C.transpose(-2, -1)) # [bsz, num_key_value_heads, q_len, codebook_size]
+
+            return x_ + C_ - 2 * inner_product
+
+        if hasattr(self, "cholesky_factor"):
+            pairwise_distance = cdist(key_states @ self.cholesky_factor, self.codebook)
+        else:
+            pairwise_distance = cdist(key_states, self.codebook)
 
         vq_ids = torch.argmin(pairwise_distance, dim=-1)
 
@@ -307,6 +330,21 @@ def llama_attention_forward_wrapper(wrope_local_window,
                     sampling_mask,
                 )
                 
+                # attn_output = torch.zeros((bsz, self.num_heads, q_len, self.head_dim), device="cpu", dtype=dtype)
+                # for batch_idx in range(bsz):
+                #     for key_value_head_idx in range(self.num_key_value_heads):
+                #         recall_indices = sampling_mask[batch_idx, key_value_head_idx, 0].nonzero().squeeze(-1)
+                #         key_states_recalled, value_states_recalled = key_states[batch_idx, key_value_head_idx, recall_indices], value_states[batch_idx, key_value_head_idx, recall_indices]
+
+                #         attention_head_begin = key_value_head_idx * self.num_key_value_groups
+                #         attention_head_end = (key_value_head_idx + 1) * self.num_key_value_groups
+                        
+                #         attn_weights = torch.matmul(query_states_wrope[batch_idx, attention_head_begin:attention_head_end], key_states_recalled.transpose(0, 1)) / math.sqrt(self.head_dim)
+                #         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(dtype)
+                #         attn_output[batch_idx, attention_head_begin:attention_head_end] = torch.matmul(attn_weights, value_states_recalled)
+
+                # assert torch.allclose(attn_output, attn_output_sparse_kernel, atol=1e-4)
+                
                 attn_output = attn_output_sparse_kernel.to(device).to(dtype)
                 attn_output = attn_output.transpose(1, 2).contiguous().reshape(bsz, q_len, -1)
 
@@ -316,29 +354,23 @@ def llama_attention_forward_wrapper(wrope_local_window,
         else:
             key_states = repeat_kv(key_states, self.num_key_value_groups)
             value_states = repeat_kv(value_states, self.num_key_value_groups)
-
-            attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-
+            
+            assert attention_mask is not None
             if attention_mask is not None:  # no matter the length, we just slice it
                 causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-                attn_weights = attn_weights + causal_mask
 
-            # upcast attention to fp32
-            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-            attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
-            attn_output = torch.matmul(attn_weights, value_states)
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                query_states,
+                key_states,
+                value_states,
+                is_causal=True
+            )
 
-            if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
-                raise ValueError(
-                    f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
-                    f" {attn_output.size()}"
-                )
+            past_key_value.offload(self.layer_idx)
 
             attn_output = attn_output.transpose(1, 2).contiguous()
 
             attn_output = attn_output.reshape(bsz, q_len, -1)
-
-            # attn_output = attn_output.to(device)
 
         if self.config.pretraining_tp > 1:
             attn_output = attn_output.split(self.hidden_size // self.config.pretraining_tp, dim=2)
@@ -392,6 +424,10 @@ class VQCacheOffload(Cache):
         self.key_cache: List[torch.Tensor] = []
         self.value_cache: List[torch.Tensor] = []
         self.vq_ids: List[torch.Tensor] = []
+
+        self.key_cache_cpu: List[torch.Tensor] = []
+        self.value_cache_cpu: List[torch.Tensor] = []
+
         # Note: There will be significant perf decrease if switching to use 5D tensors instead.
         cache_shape = (self.batch_size, self.num_key_value_heads, self.max_cache_len, self.head_dim)
         for _ in range(config.num_hidden_layers):
@@ -399,9 +435,15 @@ class VQCacheOffload(Cache):
             new_layer_value_cache = torch.zeros(cache_shape, dtype=self.dtype, device=device)
             new_layer_vq_ids = torch.zeros(cache_shape[ : -1], dtype=torch.int64, device=device)
 
+            new_layer_key_cache_cpu = torch.zeros(cache_shape, dtype=torch.float32, device="cpu").pin_memory()
+            new_layer_value_cache_cpu = torch.zeros(cache_shape, dtype=torch.float32, device="cpu").pin_memory()
+
             self.key_cache.append(new_layer_key_cache)
             self.value_cache.append(new_layer_value_cache)
             self.vq_ids.append(new_layer_vq_ids)
+
+            self.key_cache_cpu.append(new_layer_key_cache_cpu)
+            self.value_cache_cpu.append(new_layer_value_cache_cpu)
         
         self.seq_len = 0
 
@@ -432,6 +474,17 @@ class VQCacheOffload(Cache):
 
         self.seq_len = cache_position[-1] + 1
         return k_out[:, :, :self.seq_len], v_out[:, :, :self.seq_len], vq_ids_out[:, :, :self.seq_len]
+
+    def offload(
+            self,
+            layer_idx
+    ):
+        self.key_cache_cpu[layer_idx].copy_(self.key_cache[layer_idx].to(torch.float32), non_blocking=True)
+        self.value_cache_cpu[layer_idx].copy_(self.value_cache[layer_idx].to(torch.float32), non_blocking=True)
+
+    def switch_between_cpu_and_gpu(self):
+        self.key_cache = self.key_cache_cpu
+        self.value_cache = self.value_cache_cpu
 
     def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
         """Returns the sequence length of the cached states that were seen by the model."""
